@@ -1,0 +1,818 @@
+diff --git a/src/BinaryContext.cpp b/src/BinaryContext.cpp
+index 2e1a63d..e61ca7e 100644
+--- a/src/BinaryContext.cpp
++++ b/src/BinaryContext.cpp
+@@ -92,7 +92,8 @@ BinaryContext::BinaryContext(std::unique_ptr<MCContext> Ctx,
+                              std::unique_ptr<MCPlusBuilder> MIB,
+                              std::unique_ptr<const MCRegisterInfo> MRI,
+                              std::unique_ptr<MCDisassembler> DisAsm,
+-                             DataReader &DR)
++                             DataReader &DR,
++                             std::shared_ptr<ExecutableFileMemoryManager> &EFMM)
+     : Ctx(std::move(Ctx)),
+       DwCtx(std::move(DwCtx)),
+       TheTriple(std::move(TheTriple)),
+@@ -108,7 +109,8 @@ BinaryContext::BinaryContext(std::unique_ptr<MCContext> Ctx,
+       MIB(std::move(MIB)),
+       MRI(std::move(MRI)),
+       DisAsm(std::move(DisAsm)),
+-      DR(DR) {
++      DR(DR),
++      EFMM(EFMM) {
+   Relocation::Arch = this->TheTriple->getArch();
+   PageAlign = opts::NoHugePages ? RegularPageSize : HugePageSize;
+ }
+@@ -542,6 +544,7 @@ void BinaryContext::fixBinaryDataHoles() {
+           setBinaryDataSize(Hole.first, Hole.second);
+       } else {
+         getOrCreateGlobalSymbol(Hole.first, "HOLEat", Hole.second, 1);
++        FreeSpace.push_back(Hole);
+       }
+     }
+   }
+@@ -593,7 +596,7 @@ void BinaryContext::assignMemData() {
+     if (auto *BD = getBinaryDataByName(MI.Addr.Name))
+       return BD->getAddress() + MI.Addr.Offset;
+ 
+-    return 0ul;
++    return uint64_t(0);
+   };
+ 
+   // Map of sections (or heap/stack) to count/size.
+@@ -1025,7 +1028,8 @@ BinarySection &BinaryContext::registerOrUpdateSection(StringRef Name,
+                                                       uint8_t *Data,
+                                                       uint64_t Size,
+                                                       unsigned Alignment,
+-                                                      bool IsLocal) {
++                                                      bool IsLocal,
++                                                      uint64_t Address) {
+   auto NamedSections = getSectionByName(Name);
+   if (NamedSections.begin() != NamedSections.end()) {
+     assert(std::next(NamedSections.begin()) == NamedSections.end() &&
+@@ -1042,7 +1046,8 @@ BinarySection &BinaryContext::registerOrUpdateSection(StringRef Name,
+   }
+ 
+   return registerSection(new BinarySection(*this, Name, Data, Size, Alignment,
+-                                           ELFType, ELFFlags, IsLocal));
++                                           ELFType, ELFFlags, IsLocal,
++                                           Address));
+ }
+ 
+ bool BinaryContext::deregisterSection(BinarySection &Section) {
+diff --git a/src/BinaryContext.h b/src/BinaryContext.h
+index 2075821..951204a 100644
+--- a/src/BinaryContext.h
++++ b/src/BinaryContext.h
+@@ -56,6 +56,7 @@ namespace bolt {
+ 
+ class BinaryFunction;
+ class DataReader;
++class ExecutableFileMemoryManager;
+ 
+ /// Helper function to truncate a \p Value to given size in \p Bytes.
+ inline int64_t truncateToSize(int64_t Value, unsigned Bytes) {
+@@ -160,6 +161,9 @@ public:
+     FilterIterator<binary_data_const_iterator>;
+   using FilteredBinaryDataIterator = FilterIterator<binary_data_iterator>;
+ 
++  /// List of unused holes that can be used to store data
++  std::vector<std::pair<uint64_t, uint64_t>> FreeSpace;
++
+   /// [MCSymbol] -> [BinaryFunction]
+   ///
+   /// As we fold identical functions, multiple symbols can point
+@@ -259,6 +263,8 @@ public:
+ 
+   DataReader &DR;
+ 
++  std::shared_ptr<ExecutableFileMemoryManager> &EFMM;
++
+   /// Indicates if relocations are available for usage.
+   bool HasRelocations{false};
+ 
+@@ -315,7 +321,8 @@ public:
+                 std::unique_ptr<MCPlusBuilder> MIB,
+                 std::unique_ptr<const MCRegisterInfo> MRI,
+                 std::unique_ptr<MCDisassembler> DisAsm,
+-                DataReader &DR);
++                DataReader &DR,
++                std::shared_ptr<ExecutableFileMemoryManager> &EFMM);
+ 
+   ~BinaryContext();
+ 
+@@ -483,7 +490,8 @@ public:
+                                          uint8_t *Data = nullptr,
+                                          uint64_t Size = 0,
+                                          unsigned Alignment = 1,
+-                                         bool IsLocal = false);
++                                         bool IsLocal = false,
++                                         uint64_t Address = 0);
+ 
+   /// Register the information for the note (non-allocatable) section
+   /// with the given /p Name.  If the section already exists, the
+diff --git a/src/BinaryFunction.cpp b/src/BinaryFunction.cpp
+index bc3ecd4..4ddad15 100644
+--- a/src/BinaryFunction.cpp
++++ b/src/BinaryFunction.cpp
+@@ -1767,7 +1767,7 @@ bool BinaryFunction::buildCFG() {
+       addCFIPlaceholders(0, InsertBB);
+     }
+ 
+-    const auto IsBlockEnd = MIB->isTerminator(Instr);
++    const auto IsBlockEnd = MIB->isTerminator(Instr) || BC.MIB->isCall(Instr);
+     IsLastInstrNop = MIB->isNoop(Instr);
+     LastInstrOffset = Offset;
+     InsertBB->addInstruction(std::move(Instr));
+diff --git a/src/BinaryFunction.h b/src/BinaryFunction.h
+index b405ab5..3fbd40b 100644
+--- a/src/BinaryFunction.h
++++ b/src/BinaryFunction.h
+@@ -257,6 +257,9 @@ public:
+   /// Mark injected functions
+   bool IsInjected = false;
+ 
++  /// Mark functions for which successful rewriting is essential
++  bool IsMissionCritical = false;
++
+ private:
+   /// Current state of the function.
+   State CurrentState{State::Empty};
+@@ -401,15 +404,6 @@ private:
+     return BB->getIndex();
+   }
+ 
+-  /// Return basic block that originally contained offset \p Offset
+-  /// from the function start.
+-  BinaryBasicBlock *getBasicBlockContainingOffset(uint64_t Offset);
+-
+-  const BinaryBasicBlock *getBasicBlockContainingOffset(uint64_t Offset) const {
+-    return const_cast<BinaryFunction *>(this)
+-      ->getBasicBlockContainingOffset(Offset);
+-  }
+-
+   /// Return basic block that started at offset \p Offset.
+   BinaryBasicBlock *getBasicBlockAtOffset(uint64_t Offset) {
+     BinaryBasicBlock *BB = getBasicBlockContainingOffset(Offset);
+@@ -950,6 +944,15 @@ public:
+     return nullptr;
+   }
+ 
++  /// Return basic block that originally contained offset \p Offset
++  /// from the function start.
++  BinaryBasicBlock *getBasicBlockContainingOffset(uint64_t Offset);
++
++  const BinaryBasicBlock *getBasicBlockContainingOffset(uint64_t Offset) const {
++    return const_cast<BinaryFunction *>(this)
++      ->getBasicBlockContainingOffset(Offset);
++  }
++
+   /// Return instruction at a given offset in the function. Valid before
+   /// CFG is constructed or while instruction offsets are available in CFG.
+   MCInst *getInstructionAtOffset(uint64_t Offset);
+diff --git a/src/BinaryPassManager.cpp b/src/BinaryPassManager.cpp
+index 49e7d5b..9ad3a53 100644
+--- a/src/BinaryPassManager.cpp
++++ b/src/BinaryPassManager.cpp
+@@ -12,6 +12,7 @@
+ #include "BinaryPassManager.h"
+ #include "Passes/Aligner.h"
+ #include "Passes/AllocCombiner.h"
++#include "Passes/HALO.h"
+ #include "Passes/FrameOptimizer.h"
+ #include "Passes/IdenticalCodeFolding.h"
+ #include "Passes/IndirectCallPromotion.h"
+@@ -41,6 +42,7 @@ extern cl::opt<unsigned> Verbosity;
+ extern cl::opt<bool> PrintAll;
+ extern cl::opt<bool> PrintDynoStats;
+ extern cl::opt<bool> DumpDotAll;
++extern cl::list<std::string> HALO;
+ extern cl::opt<bolt::PLTCall::OptType> PLT;
+ 
+ static cl::opt<bool>
+@@ -53,7 +55,7 @@ DynoStatsAll("dyno-stats-all",
+ static cl::opt<bool>
+ EliminateUnreachable("eliminate-unreachable",
+   cl::desc("eliminate unreachable code"),
+-  cl::init(true),
++  cl::init(false),
+   cl::ZeroOrMore,
+   cl::cat(BoltOptCategory));
+ 
+@@ -203,7 +205,7 @@ PrintUCE("print-uce",
+ static cl::opt<bool>
+ SimplifyConditionalTailCalls("simplify-conditional-tail-calls",
+   cl::desc("simplify conditional tail calls by removing unnecessary jumps"),
+-  cl::init(true),
++  cl::init(false),
+   cl::ZeroOrMore,
+   cl::cat(BoltOptCategory));
+ 
+@@ -231,7 +233,7 @@ StringOps("inline-memcpy",
+ static cl::opt<bool>
+ StripRepRet("strip-rep-ret",
+   cl::desc("strip 'repz' prefix from 'repz retq' sequence (on by default)"),
+-  cl::init(true),
++  cl::init(false),
+   cl::ZeroOrMore,
+   cl::cat(BoltOptCategory));
+ 
+@@ -375,6 +377,9 @@ void BinaryFunctionPassManager::runAllPasses(
+   if (BC.isAArch64())
+       Manager.registerPass(llvm::make_unique<VeneerElimination>(PrintVeneerElimination));
+ 
++  Manager.registerPass(llvm::make_unique<HALO>(NeverPrint),
++                       !opts::HALO.empty());
++
+   Manager.registerPass(llvm::make_unique<InlineMemcpy>(NeverPrint),
+                        opts::StringOps);
+ 
+diff --git a/src/BinarySection.h b/src/BinarySection.h
+index 26e071e..c494356 100644
+--- a/src/BinarySection.h
++++ b/src/BinarySection.h
+@@ -163,11 +163,12 @@ public:
+                 unsigned Alignment,
+                 unsigned ELFType,
+                 unsigned ELFFlags,
+-                bool IsLocal)
++                bool IsLocal,
++                uint64_t Address = 0)
+     : BC(BC),
+       Name(Name),
+       Contents(reinterpret_cast<const char*>(Data), Data ? Size : 0),
+-      Address(0),
++      Address(Address),
+       Size(Size),
+       Alignment(Alignment),
+       ELFType(ELFType),
+diff --git a/src/MCPlusBuilder.h b/src/MCPlusBuilder.h
+index 851fec6..696bd91 100644
+--- a/src/MCPlusBuilder.h
++++ b/src/MCPlusBuilder.h
+@@ -1366,6 +1366,20 @@ public:
+     return {};
+   }
+ 
++  /// Creates instructions to OR a value in memory with a specified immediate
++  virtual bool createOr(MCInst &Inst, const MCExpr *Expr, uint64_t ImmVal,
++                        MCContext *Ctx) const {
++    llvm_unreachable("not implemented");
++    return false;
++  }
++
++  /// Creates instructions to AND a value in memory with a specified immediate
++  virtual bool createAnd(MCInst &Inst, const MCExpr *Expr, uint64_t ImmVal,
++                         MCContext *Ctx) const {
++    llvm_unreachable("not implemented");
++    return false;
++  }
++
+   /// Returns true if instruction is a call frame pseudo instruction.
+   virtual bool isCFI(const MCInst &Inst) const {
+     return Inst.getOpcode() == TargetOpcode::CFI_INSTRUCTION;
+diff --git a/src/Passes/Aligner.cpp b/src/Passes/Aligner.cpp
+index d95634a..5a0b925 100644
+--- a/src/Passes/Aligner.cpp
++++ b/src/Passes/Aligner.cpp
+@@ -120,7 +120,8 @@ void AlignerPass::alignBlocks(BinaryFunction &Function) {
+ 
+   const auto &BC = Function.getBinaryContext();
+ 
+-  const auto FuncCount = std::max(1UL, Function.getKnownExecutionCount());
++  const auto FuncCount = std::max(uint64_t(1),
++                                  Function.getKnownExecutionCount());
+   BinaryBasicBlock *PrevBB{nullptr};
+   for (auto *BB : Function.layout()) {
+     auto Count = BB->getKnownExecutionCount();
+@@ -140,7 +141,8 @@ void AlignerPass::alignBlocks(BinaryFunction &Function) {
+       continue;
+ 
+     const auto BlockSize = BC.computeCodeSize(BB->begin(), BB->end());
+-    const auto BytesToUse = std::min(opts::BlockAlignment - 1UL, BlockSize);
++    const auto BytesToUse = std::min(opts::BlockAlignment - uint64_t(1),
++                                     BlockSize);
+ 
+     if (opts::AlignBlocksMinSize && BlockSize < opts::AlignBlocksMinSize)
+       continue;
+diff --git a/src/Passes/BinaryPasses.cpp b/src/Passes/BinaryPasses.cpp
+index 9eb6dfb..a92f329 100644
+--- a/src/Passes/BinaryPasses.cpp
++++ b/src/Passes/BinaryPasses.cpp
+@@ -1432,7 +1432,8 @@ PrintProgramStats::runOnFunctions(BinaryContext &BC,
+       if (!BF.hasValidProfile())
+         continue;
+ 
+-      const auto HotThreshold = std::max(BF.getKnownExecutionCount(), 1UL);
++      const auto HotThreshold = std::max(BF.getKnownExecutionCount(),
++                                         uint64_t(1));
+       bool HotSeen = false;
+       for (const auto *BB : BF.rlayout()) {
+         if (!HotSeen && BB->getKnownExecutionCount() > HotThreshold) {
+diff --git a/src/Passes/CMakeLists.txt b/src/Passes/CMakeLists.txt
+index 2f3a3ca..61dadd1 100644
+--- a/src/Passes/CMakeLists.txt
++++ b/src/Passes/CMakeLists.txt
+@@ -8,6 +8,7 @@ add_llvm_library(LLVMBOLTPasses
+   CachePlusReorderAlgorithm.cpp
+   DataflowAnalysis.cpp
+   DataflowInfoManager.cpp
++  HALO.cpp
+   FrameAnalysis.cpp
+   FrameOptimizer.cpp
+   HFSort.cpp
+diff --git a/src/Passes/CachePlusReorderAlgorithm.cpp b/src/Passes/CachePlusReorderAlgorithm.cpp
+index 52db989..bcde1c1 100644
+--- a/src/Passes/CachePlusReorderAlgorithm.cpp
++++ b/src/Passes/CachePlusReorderAlgorithm.cpp
+@@ -295,7 +295,7 @@ private:
+     Size.reserve(BF.layout_size());
+     for (auto BB : BF.layout()) {
+       size_t Index = BB->getLayoutIndex();
+-      Size.push_back(std::max(BB->estimateSize(), size_t(1)));
++      Size.push_back(std::max(BB->estimateSize(), uint64_t(1)));
+       AllClusters.emplace_back(BB, ExecutionCounts[Index], Size[Index]);
+       Clusters.push_back(&AllClusters[Index]);
+       CurCluster.push_back(&AllClusters[Index]);
+diff --git a/src/Passes/HALO.cpp b/src/Passes/HALO.cpp
+new file mode 100644
+index 0000000..f351704
+--- /dev/null
++++ b/src/Passes/HALO.cpp
+@@ -0,0 +1,205 @@
++//===--- Passes/HALO.cpp - Heap Object Group Instrumentation --------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++
++#include "HALO.h"
++#include "llvm/Support/Options.h"
++
++#define DEBUG_TYPE "bolt-halo"
++
++using namespace llvm;
++
++namespace opts {
++extern cl::OptionCategory BoltOptCategory;
++cl::list<std::string>
++HALO("halo",
++  cl::CommaSeparated,
++  cl::desc("turn on HALO instrumentation for a set of call sites"),
++  cl::value_desc("index1:site1,index2:site2,index3:site3,..."),
++  cl::ZeroOrMore,
++  cl::cat(BoltOptCategory));
++}
++
++namespace llvm {
++namespace bolt {
++
++BinaryFunction *
++HALO::getBinaryFunctionContainingAddress(std::map<uint64_t,
++                                                  BinaryFunction> &BFs,
++                                         uint64_t Address) {
++  auto FI = BFs.upper_bound(Address);
++  if (FI == BFs.begin())
++    return nullptr;
++  --FI;
++
++  const auto UsedSize = FI->second.getMaxSize();
++  if (Address >= FI->first + UsedSize)
++    return nullptr;
++  return &FI->second;
++}
++
++uint64_t HALO::extendDataSegment(BinaryContext &BC) {
++  // Find the data section
++  auto DataSection = BC.getUniqueSectionByName(".data");
++  if (!DataSection) {
++    errs() << "BOLT-ERROR: HALO: unable to find data section\n";
++    exit(1);
++  }
++
++  // Find the segment to which the data section belongs
++  auto Address = DataSection->getAddress();
++  auto NextSegmentInfoI = BC.EFMM->SegmentMapInfo.upper_bound(Address);
++  if (NextSegmentInfoI == BC.EFMM->SegmentMapInfo.begin()) {
++    errs() << "BOLT-ERROR: HALO: unable to find data segment\n";
++    exit(1);
++  }
++  auto &SegmentInfo = std::prev(NextSegmentInfoI)->second;
++  if (Address < SegmentInfo.Address ||
++      Address >= SegmentInfo.Address + SegmentInfo.FileSize) {
++    errs() << "BOLT-ERROR: HALO: unable to find data segment\n";
++    exit(1);
++  }
++
++  // Make sure there's enough space to fit the group state
++  auto NewSize = SegmentInfo.Size + NewSegmentSize;
++  auto NewFileSize = SegmentInfo.FileSize + NewSegmentSize;
++  auto OldEndAddress = SegmentInfo.Address + SegmentInfo.Size;
++  auto NewEndAddress = SegmentInfo.Address + NewSize;
++  auto NewEndOffset = SegmentInfo.FileOffset + NewFileSize;
++  if (NextSegmentInfoI != BC.EFMM->SegmentMapInfo.end() &&
++      NewEndAddress > NextSegmentInfoI->second.Address &&
++      NewEndOffset > NextSegmentInfoI->second.FileOffset) {
++    errs() << "BOLT-ERROR: HALO: insufficient space in data segment\n";
++    exit(1);
++  }
++
++  // Expand the segment
++  SegmentInfo.Size = NewSize;
++  SegmentInfo.FileSize = NewFileSize;
++
++  return OldEndAddress;
++}
++
++uint64_t HALO::createStateSection(BinaryContext &BC) {
++  // Create a new section to hold group state
++  std::string InitialData;
++  const char *Name = ".data.halo_state";
++  uint64_t Address = extendDataSegment(BC);
++  raw_string_ostream OS(InitialData);
++  for (unsigned i = 0; i < NewSegmentSize; ++i)
++    OS << '\0';
++  OS.str();
++
++  // Register and return the address of the new section
++  // NOTE: We could make this ELF::SHT_NOBITS, but for now it's staying as
++  // ELF::SHT_PROGBITS for increased flexibility.
++  auto &Section = BC.registerOrUpdateSection(Name, ELF::SHT_PROGBITS,
++                                             BinarySection::getFlags(false,
++                                                                     false,
++                                                                     true),
++                                             copyByteArray(InitialData),
++                                             InitialData.size(),
++                                             InitialData.size(),
++                                             false, Address);
++  outs() << "BOLT-INFO: HALO: state variable located at 0x"
++         << Twine::utohexstr(Section.getAddress()) << "\n";
++  return Section.getAddress();
++}
++
++void HALO::instrumentSite(BinaryContext &BC,
++                          std::map<uint64_t, BinaryFunction> &BFs,
++                          uint64_t Target,
++                          unsigned Index,
++                          uint64_t StateAddr) {
++  // Find the target function
++  auto Function = getBinaryFunctionContainingAddress(BFs, Target);
++  if (Function == nullptr) {
++    errs() << "BOLT-ERROR: HALO: unable to find function at 0x"
++           << Twine::utohexstr(Target) << "\n";
++    exit(1);
++  }
++
++  // Find the target BB
++  // NOTE: Functions with AVX-512 instructions, as well as those with other
++  // quirks, won't be processed properly by BOLT and thus will fail BB lookup.
++  // In general, this can always fail (as can writing the instrumentation if
++  // there's not enough free space), so ideally we would recalculate
++  // the instrumentation points to work around this when such failures occur.
++  auto Offset = Target - Function->getAddress();
++  auto BB = Function->getBasicBlockContainingOffset(Offset);
++  if (BB == nullptr) {
++    errs() << "BOLT-ERROR: HALO: unable to find basic block at 0x"
++           << Twine::utohexstr(Target) << " (0x" << Twine::utohexstr(Offset)
++           << " from 0x" << Twine::utohexstr(Function->getAddress()) << ")\n";
++    exit(1);
++  }
++
++  // Generate instructions and check for currently problematic cases
++  // TODO: Currently we only support calls as we simply add instructions before
++  // and after the target. In future, we should support direct branches by
++  // setting the flag before the site and unsetting it at the end of the target.
++  auto II = std::prev(BB->end());
++  unsigned SiteBitFlag = 1 << Index;
++  MCInst SetSiteBit, UnsetSiteBit;
++  auto State = MCConstantExpr::create(StateAddr, *BC.Ctx.get());
++  BC.MIB->createOr(SetSiteBit, State, SiteBitFlag, BC.Ctx.get());
++  BC.MIB->createAnd(UnsetSiteBit, State, ~SiteBitFlag, BC.Ctx.get());
++  while (II != BB->begin() && !BC.MIB->isCall(*II))
++    II = std::prev(II); // TODO: This shouldn't be necessary in theory, but
++                        // sometimes instructions sneak below calls somehow...
++  if (!BC.MIB->isCall(*II)) {
++    errs() << "BOLT-ERROR: HALO: cannot instrument non-call instruction at 0x"
++           << Twine::utohexstr(Target) << "\n";
++    exit(1);
++  }
++
++  // Set group bit before call, unset group bit after call
++  // NOTE: Currently requires compiling with '-no-pie'. For this to work
++  // properly with PIC, we'll need to mess around with the GOT or calculate the
++  // distance between each instruction and the group state in the final layout.
++  // NOTE: With upstream BOLT, these modifications can fail silently if there's
++  // not enough space in the target function.
++  Function->IsMissionCritical = true;
++  II = BB->insertInstruction(II, std::move(SetSiteBit));
++  for (auto Succ = BB->succ_begin(); Succ != BB->succ_end(); ++Succ) {
++    MCInst UnsetSiteBitInst = UnsetSiteBit;
++    (*Succ)->insertInstruction((*Succ)->begin(), std::move(UnsetSiteBitInst));
++  }
++}
++
++void HALO::runOnFunctions(BinaryContext &BC,
++                          std::map<uint64_t, BinaryFunction> &BFs,
++                          std::set<uint64_t> &) {
++  if (opts::HALO.size() > GroupStateSize * CHAR_BIT) {
++    errs() << "BOLT-ERROR: HALO: too many sites\n";
++    exit(1);
++  }
++
++  // Instrument each grouped call site
++  // TODO: Right now, we don't update the '_end' symbol to the new end of the
++  // data segment (e.g. thru OLT and by updating BinaryDataMap). This is
++  // probably a bad idea in general, but it also means we can't use the existing
++  // symbol infrastructure (getOrCreateGlobalSymbol).
++  uint64_t StateAddr = createStateSection(BC);
++  for (auto Input : opts::HALO) {
++    if (!Input.length())
++      continue;
++
++    auto split = Input.find(":");
++    if (split == std::string::npos || split == Input.length() - 1) {
++      errs() << "BOLT-ERROR: HALO: invalid input '" << Input << "'\n";
++      exit(1);
++    }
++    auto Label = Input.substr(0, split);
++    auto Target = Input.substr(split + 1, std::string::npos);
++    unsigned Index = unsigned(std::strtol(Label.c_str(), NULL, 0));
++    uint64_t Address = uint64_t(std::strtol(Target.c_str(), NULL, 0));
++    instrumentSite(BC, BFs, Address, Index, StateAddr);
++}}
++} // namespace bolt
++} // namespace llvm
+\ No newline at end of file
+diff --git a/src/Passes/HALO.h b/src/Passes/HALO.h
+new file mode 100644
+index 0000000..793fe8b
+--- /dev/null
++++ b/src/Passes/HALO.h
+@@ -0,0 +1,56 @@
++//===--- Passes/HALO.h - Heap Object Group Instrumentation ----------------===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_TOOLS_LLVM_BOLT_PASSES_HALO_H
++#define LLVM_TOOLS_LLVM_BOLT_PASSES_HALO_H
++
++#include "BinaryContext.h"
++#include "BinaryFunction.h"
++#include "BinaryPasses.h"
++#include "RewriteInstance.h"
++
++namespace llvm {
++namespace bolt {
++
++class HALO : public BinaryFunctionPass {
++  uint64_t extendDataSegment(BinaryContext &BC);
++  uint64_t createStateSection(BinaryContext &BC);
++  void instrumentSite(BinaryContext &BC,
++                      std::map<uint64_t, BinaryFunction> &BFs,
++                      uint64_t Address,
++                      unsigned Index,
++                      uint64_t StateAddr);
++  BinaryFunction *
++  getBinaryFunctionContainingAddress(std::map<uint64_t, BinaryFunction> &BFs,
++                                     uint64_t Address);
++
++public:
++  static constexpr unsigned GroupStateSize = sizeof(uint64_t);
++  static constexpr unsigned NewSegmentSize = 64;
++
++  explicit HALO(const cl::opt<bool> &PrintPass)
++    : BinaryFunctionPass(PrintPass) { }
++
++  const char *getName() const override {
++    return "HALO instrumentation";
++  }
++  bool shouldPrint(const BinaryFunction &BF) const override {
++    return BinaryFunctionPass::shouldPrint(BF);
++  }
++  void runOnFunctions(BinaryContext &BC,
++                      std::map<uint64_t, BinaryFunction> &BFs,
++                      std::set<uint64_t> &LargeFunctions) override;
++};
++
++} // namespace bolt
++} // namespace llvm
++
++#endif
+diff --git a/src/Passes/IndirectCallPromotion.cpp b/src/Passes/IndirectCallPromotion.cpp
+index 941d091..3046eca 100644
+--- a/src/Passes/IndirectCallPromotion.cpp
++++ b/src/Passes/IndirectCallPromotion.cpp
+@@ -1446,12 +1446,12 @@ void IndirectCallPromotion::runOnFunctions(
+          << "BOLT-INFO: ICP percentage of indirect calls that can be "
+             "optimized = "
+          << format("%.1f", (100.0 * TotalNumFrequentCalls) /
+-                   std::max(TotalIndirectCalls, 1ul))
++                   std::max(TotalIndirectCalls, uint64_t(1)))
+          << "%\n"
+          << "BOLT-INFO: ICP percentage of indirect callsites that are "
+             "optimized = "
+          << format("%.1f", (100.0 * TotalOptimizedIndirectCallsites) /
+-                   std::max(TotalIndirectCallsites, 1ul))
++                   std::max(TotalIndirectCallsites, uint64_t(1)))
+          << "%\n"
+          << "BOLT-INFO: ICP number of method load elimination candidates = "
+          << TotalMethodLoadEliminationCandidates
+@@ -1459,17 +1459,17 @@ void IndirectCallPromotion::runOnFunctions(
+          << "BOLT-INFO: ICP percentage of method calls candidates that have "
+             "loads eliminated = "
+          << format("%.1f", (100.0 * TotalMethodLoadsEliminated) /
+-                   std::max(TotalMethodLoadEliminationCandidates, 1ul))
++                   std::max(TotalMethodLoadEliminationCandidates, uint64_t(1)))
+          << "%\n"
+          << "BOLT-INFO: ICP percentage of indirect branches that are "
+             "optimized = "
+          << format("%.1f", (100.0 * TotalNumFrequentJmps) /
+-                   std::max(TotalIndirectJmps, 1ul))
++                   std::max(TotalIndirectJmps, uint64_t(1)))
+          << "%\n"
+          << "BOLT-INFO: ICP percentage of jump table callsites that are "
+          << "optimized = "
+          << format("%.1f", (100.0 * TotalOptimizedJumpTableCallsites) /
+-                   std::max(TotalJumpTableCallsites, 1ul))
++                   std::max(TotalJumpTableCallsites, uint64_t(1)))
+          << "%\n"
+          << "BOLT-INFO: ICP number of jump table callsites that can use hot "
+          << "indices = " << TotalIndexBasedCandidates
+@@ -1477,7 +1477,7 @@ void IndirectCallPromotion::runOnFunctions(
+          << "BOLT-INFO: ICP percentage of jump table callsites that use hot "
+             "indices = "
+          << format("%.1f", (100.0 * TotalIndexBasedJumps) /
+-                   std::max(TotalIndexBasedCandidates, 1ul))
++                   std::max(TotalIndexBasedCandidates, uint64_t(1)))
+          << "%\n";
+ 
+ #ifndef NDEBUG
+diff --git a/src/ProfileReader.cpp b/src/ProfileReader.cpp
+index 9851814..87802cd 100644
+--- a/src/ProfileReader.cpp
++++ b/src/ProfileReader.cpp
+@@ -266,9 +266,10 @@ ProfileReader::readProfile(const std::string &FileName,
+ 
+   auto profileMatches = [](const yaml::bolt::BinaryFunctionProfile &Profile,
+                            BinaryFunction &BF) {
++    uint64_t hash = BF.hash(/*Recompute = */false);
+     if (opts::IgnoreHash && Profile.NumBasicBlocks == BF.size())
+       return true;
+-    if (!opts::IgnoreHash && Profile.Hash == BF.hash(/*Recompute = */false))
++    if (!opts::IgnoreHash && Profile.Hash == hash)
+       return true;
+     return false;
+   };
+diff --git a/src/RewriteInstance.cpp b/src/RewriteInstance.cpp
+index ae6e5d5..1b59e8f 100644
+--- a/src/RewriteInstance.cpp
++++ b/src/RewriteInstance.cpp
+@@ -630,6 +630,7 @@ StringRef getSectionName(SectionRef Section) {
+ /// triple \p TripleName.
+ std::unique_ptr<BinaryContext>
+ createBinaryContext(ELFObjectFileBase *File, DataReader &DR,
++                    std::shared_ptr<ExecutableFileMemoryManager> &EFMM,
+                     std::unique_ptr<DWARFContext> DwCtx) {
+   std::string ArchName;
+   std::string TripleName;
+@@ -754,7 +755,7 @@ createBinaryContext(ELFObjectFileBase *File, DataReader &DR,
+                                        std::move(MIB),
+                                        std::move(MRI),
+                                        std::move(DisAsm),
+-                                       DR);
++                                       DR, EFMM);
+ 
+   return BC;
+ }
+@@ -766,7 +767,7 @@ RewriteInstance::RewriteInstance(ELFObjectFileBase *File, DataReader &DR,
+                                  const char *const *Argv)
+     : InputFile(File), Argc(Argc), Argv(Argv), DA(DA),
+       BC(createBinaryContext(
+-          File, DR,
++          File, DR, EFMM,
+           DWARFContext::create(*File, nullptr,
+                                DWARFContext::defaultErrorHandler, "", false))),
+       SHStrTab(StringTableBuilder::ELF) {}
+@@ -778,7 +779,7 @@ void RewriteInstance::reset() {
+   FileSymRefs.clear();
+   auto &DR = BC->DR;
+   BC = createBinaryContext(
+-      InputFile, DR,
++      InputFile, DR, EFMM,
+       DWARFContext::create(*InputFile, nullptr,
+                            DWARFContext::defaultErrorHandler, "", false));
+   CFIRdWrt.reset(nullptr);
+@@ -3502,7 +3503,14 @@ void RewriteInstance::patchELFPHDRTable() {
+       OS.write(reinterpret_cast<const char *>(&NewTextPhdr),
+                sizeof(NewTextPhdr));
+       AddedSegment = true;
++    } else if (Phdr.p_type == ELF::PT_LOAD) {
++      // Rewrite segment info
++      NewPhdr.p_vaddr = EFMM->SegmentMapInfo[NewPhdr.p_vaddr].Address;
++      NewPhdr.p_memsz = EFMM->SegmentMapInfo[NewPhdr.p_vaddr].Size;
++      NewPhdr.p_offset = EFMM->SegmentMapInfo[NewPhdr.p_vaddr].FileOffset;
++      NewPhdr.p_filesz = EFMM->SegmentMapInfo[NewPhdr.p_vaddr].FileSize;
+     }
++
+     OS.write(reinterpret_cast<const char *>(&NewPhdr), sizeof(NewPhdr));
+   }
+ 
+@@ -3632,7 +3640,7 @@ void RewriteInstance::rewriteNoteSections() {
+   }
+ 
+   // Write new note sections.
+-  for (auto &Section : BC->nonAllocatableSections()) {
++  for (auto &Section : BC->sections()) {
+     if (Section.getFileOffset() || !Section.getAllocAddress())
+       continue;
+ 
+@@ -3784,7 +3792,7 @@ std::vector<uint32_t> RewriteInstance::getOutputSections(
+       continue;
+ 
+     auto NewSection = Section;
+-    if (SectionName == ".bss") {
++    if (SectionName == ".bss" || SectionName == ".data.halo_state") {
+       // .bss section offset matches that of the next section.
+       NewSection.sh_offset = NewTextSegmentOffset;
+     }
+@@ -3916,7 +3924,7 @@ std::vector<uint32_t> RewriteInstance::getOutputSections(
+     return NewSectionIndex;
+ 
+   // Create entries for new non-allocatable sections.
+-  for (auto &Section : BC->nonAllocatableSections()) {
++  for (auto &Section : BC->sections()) {
+     if (Section.getFileOffset() <= LastFileOffset)
+       continue;
+ 
+@@ -3927,7 +3935,7 @@ std::vector<uint32_t> RewriteInstance::getOutputSections(
+     ELFShdrTy NewSection;
+     NewSection.sh_name = SHStrTab.getOffset(Section.getName());
+     NewSection.sh_type = Section.getELFType();
+-    NewSection.sh_addr = 0;
++    NewSection.sh_addr = Section.isAllocatable() ? Section.getAddress() : 0;
+     NewSection.sh_offset = Section.getFileOffset();
+     NewSection.sh_size = Section.getOutputSize();
+     NewSection.sh_entsize = 0;
+@@ -4500,15 +4508,17 @@ void RewriteInstance::rewriteFile() {
+         continue;
+ 
+       if (Function.getImageSize() > Function.getMaxSize()) {
+-        if (opts::Verbosity >= 1) {
+-          errs() << "BOLT-WARNING: new function size (0x"
++        if (Function.IsMissionCritical || opts::Verbosity >= 1) {
++          errs() << "BOLT-ERROR: new function size (0x"
+                  << Twine::utohexstr(Function.getImageSize())
+                  << ") is larger than maximum allowed size (0x"
+                  << Twine::utohexstr(Function.getMaxSize())
+                  << ") for function " << Function << '\n';
+         }
+         FailedAddresses.emplace_back(Function.getAddress());
+-        continue;
++        if (!Function.IsMissionCritical)
++          continue;
++        exit(1);
+       }
+ 
+       if (Function.isSplit() && (Function.cold().getImageAddress() == 0 ||
+diff --git a/src/Target/X86/X86MCPlusBuilder.cpp b/src/Target/X86/X86MCPlusBuilder.cpp
+index b758146..34a3679 100644
+--- a/src/Target/X86/X86MCPlusBuilder.cpp
++++ b/src/Target/X86/X86MCPlusBuilder.cpp
+@@ -2759,6 +2759,28 @@ public:
+     return Code;
+   }
+ 
++  bool createOr(MCInst &Inst, const MCExpr *Target, uint64_t ImmVal,
++                MCContext *Ctx) const override {
++    Inst = MCInstBuilder(X86::OR32mi).addReg(X86::NoRegister) // BaseReg
++                                     .addImm(1)               // ScaleAmt
++                                     .addReg(X86::NoRegister) // IndexReg
++                                     .addExpr(Target)         // Displacement
++                                     .addReg(X86::NoRegister) // AddrSegmentReg
++                                     .addImm(ImmVal);
++    return true;
++  }
++
++  bool createAnd(MCInst &Inst, const MCExpr *Target, uint64_t ImmVal,
++                 MCContext *Ctx) const override {
++    Inst = MCInstBuilder(X86::AND32mi).addReg(X86::NoRegister) // BaseReg
++                                      .addImm(1)               // ScaleAmt
++                                      .addReg(X86::NoRegister) // IndexReg
++                                      .addExpr(Target)         // Displacement
++                                      .addReg(X86::NoRegister) // AddrSegmentReg
++                                      .addImm(ImmVal);
++    return true;
++  }
++
+   bool replaceImmWithSymbol(MCInst &Inst, MCSymbol *Symbol, int64_t Addend,
+                             MCContext *Ctx, int64_t &Value,
+                             uint64_t RelType) const override {

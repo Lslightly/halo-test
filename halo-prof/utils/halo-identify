@@ -1,0 +1,284 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import os
+import sys
+import argparse
+import numpy as np
+from math import sqrt
+from collections import Counter
+from sets import Set
+
+MAX_SITES = 64
+
+groups = []   # Global list of group objects
+contexts = {} # Global map from context IDs to context objects
+
+# A context is a chain of call sites associated with a particular group 
+class Context(object):
+    INVALID_GROUP_ID = -1
+    def __init__(self, group_id, chain):
+        self.group_id = group_id
+        self.chain = chain
+
+    # Expand each location in the context to all its possible abstractions
+    def expand(self):
+        self.chain = [abstraction for location in self.chain
+                                  for abstraction in abstractions(location)]
+
+# Groups are collection of contexts identified by a unique ID
+class Group(object):
+    next_id = 1
+    def __init__(self):
+        self.id = Group.next_id
+        self.contexts = []
+        Group.next_id += 1
+
+    def add_context(self, context_id, chain):
+        context = Context(self.id, chain)
+        self.contexts.append(context)
+        if context_id not in contexts:
+            contexts[context_id] = context
+
+# Use call sites to represent chain entries, not the destination function. Don't
+# use a combination of the two as it's easier to treat indirect calls uniformly.
+def chain_entry(site):
+    return (site,)
+
+# Generate all possible abstractions for a particular entry in a call site chain
+def abstractions(location):
+    # NOTE: Right now, the back-end doesn't support generalising to an
+    # entire function from a specific call site, so the only supported
+    # 'abstraction' is the site itself
+    site = location[0]
+    return [(site,)]
+
+# Count the number of occurences of each context matching some selector within
+# each object group
+def count_matches(selector, contexts):
+    results = {}
+    for context in contexts.values():
+        if selector.issubset(Set(context.chain)):
+            for location in context.chain:
+                if location not in results:
+                    results[location] = Counter()
+                results[location][context.group_id] += 1
+    return results
+
+def analyse(groups, contexts, max_size, max_selector_length, exclude, outdir):
+    # Expand each location in each context to all its possible abstractions
+    for context in contexts.values():
+        context.expand()
+
+    # Process groups from strongest to weakest
+    avoid = []
+    results = {}
+    for group in groups:
+        results[group.id] = []
+        avoid.append(group.id)
+        for context in group.contexts:
+            # Find a chain of call sites that uniquely identifies this context
+            # or other objects within this group
+            selector = Set()
+            conflicts = np.inf
+            while conflicts and len(selector) < max_selector_length:
+                # NOTE: In the case of a draw, we prefer the minimum lower in
+                # the stack (i.e. closer to 'main')
+                matches = count_matches(selector, contexts)
+                ext_matches = [(loc, sum(conflicts for group_id, conflicts
+                                         in matches.get(loc, {}).items()
+                                         if group_id not in avoid))
+                               for loc in context.chain if loc not in exclude and loc[0] != 0]
+                if len(ext_matches) == 0:
+                    break
+                minimum, count = min(ext_matches, key=lambda x: x[1])
+
+                # Since we currently only identify indirect branches with their
+                # source call sites and not also their destinations, we can
+                # have situations where unique identification is impossible. If
+                # adding a new item to the selector doesn't help things, stop.
+                if count == conflicts:
+                    break
+
+                # Add to the selector
+                conflicts = count
+                selector.add(minimum)
+            selector_locs = sorted(selector,
+                                   key=lambda loc: context.chain.index(loc))
+
+            # Reduce this chain, attempting to generalise each call site to the
+            # function containing it (requiring that the result still uniquely
+            # identifies objects within this group)
+            # NOTE: We reduce from the most specific to least specific site as,
+            # in most cases, increased specificity means more frequent execution
+            for location in reversed(selector_locs):
+                for abstracted in abstractions(location):
+                    new_selector = selector - Set([location])
+                    new_selector.add(abstracted)
+                    matches = count_matches(new_selector, contexts)
+                    matches = sum(v for cntr in matches.values()
+                                  for k, v in cntr.items() if k != group.id)
+                    if not matches:
+                        selector = new_selector
+                        break
+            results[group.id].append(list(selector))
+
+        # If the group is too large, discard it
+        num_sites = sum(len(s) for group in results.values() for s in group)
+        if num_sites > MAX_SITES:
+            results.pop(group.id)
+
+    # Assign unique IDs to call sites
+    loc_ids = {}
+    next_site_id = 0
+    for group_id, group in sorted(results.items()):
+        for selector in group:
+            for location in selector:
+                if location not in loc_ids:
+                    loc_ids[location] = next_site_id
+                    next_site_id += 1
+
+    # Print BOLT HALO command line
+    print 'BOLT command line:',
+    print 'llvm-bolt $INPUT -o $OUTPUT -halo',
+    site_id_list = sorted(loc_ids.items(), key=lambda x: x[1])
+    site_id_list = ['{}:0x{:X}'.format(loc_id, loc[0])
+                    for loc, loc_id in site_id_list]
+    print ','.join(site_id_list) if site_id_list else '""'
+
+    # Generate 'identify.h'
+    with open(os.path.join(outdir, 'identify.h'), 'w') as outfile:
+        # Header guards
+        outfile.write("#ifndef IDENTIFY_H\n")
+        outfile.write("#define IDENTIFY_H\n")
+        outfile.write("#ifndef TEST\n\n")
+
+        # Define constants
+        outfile.write("#define NUM_GROUPS {: >4}\n".format(len(results)))
+        outfile.write("#define MAX_SIZE   {: >4}\n".format(max_size))
+        outfile.write("#define MAX_ALIGN  {: >4}\n".format(8))
+        outfile.write("\n")
+
+        # Define group membership macros
+        outfile.write("#define BIT_SET(val, bit) ((val) & (1ULL << (bit)))\n");
+        for group_id, group in sorted(results.items()):
+            conditions = []
+            base = "#define IN_GROUP_{}(state) (".format(group_id)
+            cond_joiner = " || \\\n" + " " * len(base)
+            for selector in group:
+                cond = "(" + " && ".join([("BIT_SET(state, {}) "
+                                           "/* 0x{:X} */").format(loc_ids[loc],
+                                                                  loc[0])
+                                          for loc in selector]) + ")"
+                if cond not in conditions:
+                    conditions.append(cond)
+            outfile.write(base);
+            outfile.write(cond_joiner.join(conditions))
+            outfile.write(")\n");
+        outfile.write("\n")
+
+        # Define 'group_state' global
+        outfile.write("// Current group state (bit field of locations)\n"
+                      "static uint64_t *group_state;\n"
+                      "\n\n")
+
+        # Implement 'get_group_id'
+        outfile.write("static int get_group_id(size_t size)\n"
+                      "{\n"
+                      "    int id = -1;\n"
+                      "    if (size > MAX_SIZE)\n"
+                      "        return id;\n"
+                      "    else if (unlikely(group_state == NULL))"
+                      "        group_state = get_group_state();\n\n")
+        outfile.write("    // Group membership checks\n"
+                      "    uint64_t state = *group_state;\n")
+        for i, (group_id, group) in enumerate(sorted(results.items())):
+            kwd = "if" if i == 0 else "else if"
+            outfile.write("    {} (IN_GROUP_{}(state))\n".format(kwd, group_id))
+            outfile.write("        id = {};\n".format(i))
+        outfile.write("\n")
+        outfile.write("    return id;\n")
+        outfile.write("}\n")
+
+        # End of file
+        outfile.write('\n')
+        outfile.write("#endif\n")
+        outfile.write("#endif\n")
+        outfile.write("\n")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--groups', required=True)
+    parser.add_argument('--contexts', required=True)
+    parser.add_argument('--max-object-size', type=int, default=4096)
+    parser.add_argument('--max-selector-length', type=int, default=sys.maxint)
+    parser.add_argument('--outdir', default=os.getcwd())
+    parser.add_argument('--exclude', action='append', default=[])
+    args = parser.parse_args()
+    args.exclude = [chain_entry(int(x, 0)) for x in args.exclude]
+
+    # Parse groups (and their contexts)
+    chain = []
+    group = None
+    context_id = None
+    with open(args.groups) as file:
+        lines = [line.strip() for line in file] + ['']
+        for line in lines:
+            group_line = line.startswith('GRP')
+            context_line = line.startswith('CTX')
+            if line and not (group_line or context_line):
+                # Build up the full stack chain for the current context
+                funcname, _, site = line.strip().split(' ')
+                if not site.startswith("0x"):
+                    chain.insert(0, chain_entry(int(site)))
+                else:
+                    chain.insert(0, chain_entry(int(site, 16)))
+            else:
+                # If we've reached a group boundary, add the group that's been
+                # built up so far to the list of groups (also updates the
+                # context dictionary)
+                if chain:
+                    group.add_context(context_id, chain)
+                    if group not in groups:
+                        groups.append(group)
+                chain = []
+
+                # Set the current group/context state
+                if group_line:
+                    group = Group()
+                elif context_line:
+                    _, context_id = line.rstrip().split(' ')
+                    context_id = int(context_id.rstrip(':'))
+
+    # Parse all contexts (including those not in groups)
+    chain = []
+    context_id = None
+    with open(args.contexts) as file:
+        lines = [line.strip() for line in file] + ['']
+        for line in lines:
+            if line and not line.startswith('CTX'):
+                # Build up the full stack chain for the current context
+                funcname, _, site = line.strip().split(' ')
+                chain.insert(0, chain_entry(int(site, 16)))
+            else:
+                # If we've reached a context boundary, add the context that's
+                # been built up so far to the context dictionary
+                if chain and context_id not in contexts:
+                    contexts[context_id] = Context(Context.INVALID_GROUP_ID,
+                                                   chain)
+                chain = []
+
+                # Set the current context state
+                components = line.rstrip().split(' ')
+                if components[0] == 'CTX':
+                    context = components[1]
+                    context_id = int(context.rstrip(':'))
+
+    # Analyse
+    if args.max_selector_length == 0:
+        args.max_selector_length = sys.maxint
+    analyse(groups, contexts, args.max_object_size, args.max_selector_length,
+            args.exclude, args.outdir)
+
+if __name__ == "__main__":
+    main()

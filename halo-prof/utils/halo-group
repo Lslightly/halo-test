@@ -1,0 +1,162 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import os
+import sys
+import argparse
+import numpy as np
+from math import sqrt
+from collections import Counter
+import networkx as nx
+
+# The default networkx 'degree' function double counts self-edges, so we need
+# our own version
+def degree(graph):
+    results = Counter()
+    self_edges = 0
+    for src, dst, weight in graph.edges.data('weight'):
+        results[src] += weight
+        if src != dst:
+            results[dst] += weight
+        else:
+            self_edges += 1
+    return results, self_edges
+
+# Rank nodes by their hottest edges (i.e. strongest relationships)
+def node_heat(graph, available):
+    results = Counter()
+    for src, dst, weight in graph.edges.data('weight'):
+        if src not in available or dst not in available:
+            continue
+        results[src] = max(results[src], weight)
+        results[dst] = max(results[dst], weight)
+    return results
+
+# Rank available nodes via node_heat
+def rank_available_nodes(graph, available):
+    available = node_heat(graph, available).items()
+    available = sorted(available, key=lambda (i, x): -x)
+    return [i for i, x in available]
+
+# Only merge if it's beneficial for both parties
+def merge_benefit(group_a, group_b, graph, merge_tolerance):
+    group_a_alone = nx.Graph(graph.subgraph(group_a))
+    group_b_alone = nx.Graph(graph.subgraph(group_b))
+    separated = max(score(group_a_alone), score(group_b_alone))
+    together = score(nx.Graph(graph.subgraph(group_a + group_b)))
+    return together - (separated * (1.0 - merge_tolerance))
+
+# Based loosely on weighted graph density
+def score(graph):
+    num_nodes = float(graph.number_of_nodes())
+    node_degrees, self_edges = degree(graph)
+    max_edges = self_edges + ((num_nodes * (num_nodes - 1)) / 2)
+    return (float(sum(node_degrees.values())) / max_edges) if max_edges else 0
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--graph', required=True)
+    parser.add_argument('--contexts', required=True)
+    parser.add_argument('--tolerance', type=float, default=0.05)
+    parser.add_argument('--min-edge-weight', type=int, default=25)
+    parser.add_argument('--max-group-size', type=int, default=20)
+    parser.add_argument('--max-groups', type=int, default=15)
+    parser.add_argument('--min-group-access-percentage', type=float, default=0.025)
+    parser.add_argument('--outdir')
+    args = parser.parse_args()
+
+    # Parse graph
+    graph = nx.Graph()
+    group_id = 0
+    parsed_nodes = False
+    with open(args.graph) as f:
+        for line in f:
+            if line[0] == '#': # Parse TGF 'end of node list' delimiter
+                parsed_nodes = True
+            elif parsed_nodes: # Parse edge
+                edge = line.split()
+                src = int(edge[0])
+                dst = int(edge[1])
+                weight = int(edge[2])
+                if weight >= args.min_edge_weight:
+                    graph.add_edge(src, dst, weight=weight)
+            else:              # Parse node
+                node = line.split()
+                number = int(node[0])
+                access_count = int(node[1])
+                graph.add_node(number, accesses=access_count, group=group_id)
+    group_id += 1
+
+    # Parse contexts
+    contexts = {}
+    with open(args.contexts) as f:
+        chain = []
+        last_context = None
+        for line in f:
+            if line[0] == '\t':
+                funcname, _, site = line.strip().split(' ')
+                site = int(site, 16)
+                chain.append((funcname, site))
+            else:
+                if last_context is not None:
+                    contexts[last_context] = chain
+                _, context = line.rstrip().split(' ')
+                last_context = int(context.rstrip(':'))
+                chain = []
+    contexts[last_context] = chain
+
+    # Perform locality grouping
+    groups = []
+    available = rank_available_nodes(graph, graph.nodes)
+    while available:
+        # Form a group
+        group = [available.pop(0)]
+
+        # Grow the group
+        while len(group) < args.max_group_size:
+            best_match = None
+            best_score = 0.0
+            group_graph = nx.Graph(graph.subgraph(group))
+            for stranger in available:
+                improvement = merge_benefit(group, [stranger], graph,
+                                            args.tolerance)
+                if improvement > best_score:
+                    best_match = stranger
+                    best_score = improvement
+            if best_match is None:
+                break
+            available.remove(best_match)
+            group.append(best_match)
+        available = rank_available_nodes(graph, available)
+
+        # Add the completed group to the list
+        node_degrees, _ = degree(group_graph)
+        groups.append((group, sum(node_degrees.values())))
+
+    # Print groups
+    groups = sorted(groups, key=lambda (g, w): -w)
+    total_accesses = sum(x for i, x in graph.nodes.data('accesses'))
+    with open(os.path.join(args.outdir, 'groups.txt'), 'w') as outfile:
+        for group, weight in groups:
+            if group_id > args.max_groups:
+                break
+            elif weight < (total_accesses * args.min_group_access_percentage) and len(groups) > 1:
+                continue
+
+            # Write to the output 'groups' file
+            outfile.write('GRP {} {}:\n'.format(group_id, weight))
+            for i in group:
+                c = contexts[i]
+                outfile.write('\tCTX {}:\n\t\t'.format(i))
+                chain = '\n\t\t'.join(['{} from 0x{:X}'.format(f, s)
+                                       for f, s in c])
+                outfile.write(chain + '\n')
+
+
+            # Set the 'group' attributes of the relevant nodes
+            for i in group:
+                graph.nodes[i]['group'] = group_id
+            group_id += 1
+    nx.write_gexf(graph, os.path.join(args.outdir, 'groups.gexf'))
+
+if __name__ == "__main__":
+    main()

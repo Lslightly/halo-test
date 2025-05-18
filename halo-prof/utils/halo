@@ -1,0 +1,597 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import os
+import sys
+import copy
+import json
+import colorsys
+import operator
+import argparse
+import traceback
+import subprocess
+import numpy as np
+import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from cycler import cycler
+from collections import defaultdict
+from matplotlib.ticker import FuncFormatter
+from multiprocessing import Pool, Semaphore, cpu_count
+
+execute_resource = None
+
+def hex_to_rgb(hex_str):
+    if hex_str.startswith('#'):
+        hex_str = hex_str[1:]
+    return tuple([float(int(hex_str[i:i + 2], 16)) / 255.0 for i in xrange(0, len(hex_str), 2)])
+
+
+def rgb_to_hex(rgb):
+    return '#' + ''.join(["%0.2X" % (c * 255) for c in rgb])
+
+def make_numeric(s):
+    try:
+        return int(s.replace(',', ''))
+    except ValueError:
+        return float(s.replace(',', ''))
+
+def make_executable(path):
+    mode = os.stat(path).st_mode
+    mode |= (mode & 0o444) >> 2
+    os.chmod(path, mode)
+
+def newer(a, b):
+    return os.path.getmtime(a) > os.path.getmtime(b)
+
+def execute(cmds, cwd=None, shell=False):
+    if isinstance(cmds, list):
+        cmds = [str(cmd) for cmd in cmds]
+        print ' '.join(cmds)
+    else:
+        print cmds
+    return subprocess.check_output(cmds, cwd=cwd, shell=shell,
+                                   stderr=subprocess.STDOUT)
+
+def init(args):
+    global execute_resource
+    execute_resource = Semaphore(args.max_run_tasks)
+
+def run_trials_carefully(x):
+    try:
+        return run_trials(x)
+    except:
+        print traceback.format_exc()
+        sys.exit(1)
+
+def run_trials((scripts, destination, args)):
+    if args.setup_only:
+        return
+    events = ['time elapsed']
+    events += args.pmu_events.split(',') if args.pmu_events else []
+    events += args.allocator_events.split(',') if args.allocator_events else []
+    allocator = 'jemalloc' if args.jemalloc else 'malloc'
+    resultfile = ('results-' + str(allocator)  + '-' +
+                  '-'.join(events).replace(' ', '-') + '-' + str(args.trials) +
+                  '-trials.json')
+    resultfile = os.path.join(destination, resultfile)
+    with execute_resource:
+        total_trials = (args.trials + 1) * len(scripts)
+        if not os.path.isfile(resultfile):
+            perf_stat = ['perf', 'stat']
+            if args.pmu_events:
+                perf_stat += ['-e', args.pmu_events]
+            results = {}
+            for cmd, cwd in scripts:
+                label = os.path.basename(cmd[0])
+                def extract(lines, specifier):
+                    matches = [l for l in lines if specifier in l]
+                    if not matches:
+                        raise ValueError("invalid specifier '{}'".format(specifier))
+                    match = matches[0].strip().split(' ')
+                    match = match[-1] if match[0][0] == '[' else match[0]
+                    value = make_numeric(match)
+                    results[label].setdefault(specifier, [])
+                    results[label][specifier].append(value)
+                results[label] = {}
+                for trial in range(args.trials + 1):
+                    print '[*] Running trial {}/{} for {}...'.format(trial,
+                                                                     args.trials,
+                                                                     label)
+                    lines = execute(perf_stat + cmd,
+                                    cwd=cwd).split('\n')
+                    lines = filter(None, lines)
+                    if trial > 0 or not args.trials:
+                        for event in events:
+                            extract(lines, event)
+            results = { 'type': 'run', 'data': results }
+            with open(resultfile, 'w') as outfile:
+                json.dump(results, outfile)
+                outfile.write('\n')
+            print '[*] Complete!'
+        else:
+            print '[*] Found existing results file!'
+    return (args, resultfile)
+
+def baseline(args):
+    destination = os.path.join(args.directory, 'baseline')
+    if not os.path.exists(destination):
+        os.makedirs(destination)
+    cwd = os.path.dirname(os.path.abspath(args.cmd_args[0]))
+    original_binary = os.path.basename(args.cmd_args[0])
+    args.cmd_args[0] = './' + original_binary
+    script = os.path.join(destination, 'run-baseline-default.sh')
+    if args.jemalloc:
+        original_jemalloc_binary = original_binary + '-jemalloc'
+        execute(['cp', original_binary, original_jemalloc_binary], cwd=cwd)
+        execute(['patchelf', '--add-needed', 'libjemalloc.so.2', original_jemalloc_binary], cwd=cwd)
+        args.cmd_args[0] = './' + original_jemalloc_binary
+        script = os.path.join(destination, 'run-baseline-jemalloc.sh')
+    with open(script, 'w') as runscript:
+        runscript.write(' '.join(args.cmd_args) + '\n')
+    make_executable(script)
+    cmds = [([script], cwd)]
+    return run_trials((cmds, destination, args))
+
+def setup(args):
+    # Ensure destination directory exists
+    destination  = 'affinity-{}'.format(args.affinity_distance)
+    destination += '-max-object-size-{}'.format(args.max_object_size)
+    if args.training_inst_limit != 0:
+        destination += '-training-inst-limit-{}'.format(args.training_inst_limit)
+    if args.max_stack_depth != 0:
+        destination += '-max-stack-depth-{}'.format(args.max_stack_depth)
+    destination += '-min-edge-weight-{}'.format(args.min_edge_weight)
+    destination += '-merge-tolerance-{}'.format(args.merge_tolerance)
+    destination += '-min-group-access-percentage-{}'.format(args.min_group_access_percentage)
+    if args.max_selector_length != 0:
+        destination += '-max-selector-length-{}'.format(args.max_selector_length)
+    destination += '-chunk-size-{}'.format(args.chunk_size)
+    destination += '-max-spare-chunks-{}'.format(args.max_spare_chunks)
+    destination = os.path.join(args.directory, destination)
+    if not os.path.exists(destination):
+        os.makedirs(destination)
+
+    # Save initial command line
+    setup_log = os.path.join(destination, 'setup.log')
+    with open(setup_log, 'w') as log:
+        cmdline = ' '.join(sys.argv)
+        log.write(cmdline + '\n')
+
+    # Parameter preprocessing
+    contexts = args.contexts
+    graph = args.graph
+    if graph is None and contexts is None:
+        contexts = os.path.join(destination, 'contexts.txt')
+        graph = os.path.join(destination, 'graph.tgf')
+    elif graph == contexts:
+        raise ValueError('invalid combination of --graph and --contexts')
+    original_train_binary = os.path.abspath(args.train_cmd_args[0])
+    original_ref_binary = os.path.abspath(args.ref_cmd_args[0])
+    train_cwd = os.path.dirname(original_train_binary)
+    ref_cwd = os.path.dirname(original_ref_binary)
+    args.train_cmd_args[0] = './' + os.path.basename(original_train_binary)
+    if args.run_script:
+        cmds = [([os.path.abspath(args.run_script)], ref_cwd)]
+        return (cmds, destination, args)
+
+    # halo-prof
+    if not (os.path.isfile(contexts) and os.path.isfile(graph)):
+        print '[*] Profiling workload...'
+        halo_prof_path = os.environ['HALO_PROF_PATH']
+        tool_path = os.path.join(halo_prof_path, 'obj-intel64',
+                                 'halo-prof.so')
+        execute(' '.join(['pin', '-t', tool_path,
+                 '-contexts_output', contexts, '-tgf_output', graph,
+                 '-max_object_size', str(args.max_object_size),
+                 '-instruction_limit', str(args.training_inst_limit),
+                 '-max_stack_depth', str(args.max_stack_depth),
+                 '-affinity_distance', str(args.affinity_distance),
+                 '--'] + args.train_cmd_args), cwd=train_cwd, shell=True)
+    else:
+        print '[*] Found existing locality graph and contexts file...'
+
+    # halo-group
+    groups = os.path.join(destination, 'groups.txt')
+    if not os.path.isfile(groups):
+        print '[*] Grouping allocation contexts...'
+        execute(['halo-group', '--outdir', destination, '--graph', graph,
+                 '--contexts', contexts,
+                 '--min-edge-weight', args.min_edge_weight,
+                 '--tolerance', args.merge_tolerance,
+                 '--max-groups', args.max_groups,
+                 '--min-group-access-percentage',
+                 args.min_group_access_percentage])
+    else:
+        print '[*] Found existing groups file...'
+
+    # halo-identify and llvm-bolt
+    #if (newer(original_train_binary, graph) or
+    #    newer(original_ref_binary, graph)):
+    #    raise ValueError('stale locality graph detected')
+    modified_binary_name = os.path.basename(original_train_binary) + '.bolt'
+    modified_binary = os.path.join(destination, modified_binary_name)
+    if not os.path.isfile(modified_binary):
+        print '[*] Optimising binary...'
+        cmd = ['halo-identify', '--outdir', destination,
+               '--groups', groups, '--contexts', contexts,
+               '--max-object-size', args.max_object_size,
+               '--max-selector-length', args.max_selector_length]
+        for exclude in args.selector_exclude:
+            cmd += ['--exclude', exclude]
+        cmd = execute(cmd)
+        cmd = cmd.strip()
+        cmd = cmd.replace('$INPUT', original_train_binary)
+        cmd = cmd.replace('$OUTPUT', modified_binary)
+        separator = cmd.index('llvm-bolt')
+        execute(cmd[separator:], shell=True)
+    else:
+        print '[*] Found existing optimised binary...'
+
+    # libhalo
+    libhalo_path = os.environ['LIBHALO_PATH']
+    libhalo_header = os.path.join(destination, 'identify.h')
+    libhalo = os.path.join(destination, 'libhalo.so')
+    libhalo_stats = os.path.join(destination, 'libhalo-stats.so')
+    if not (os.path.isfile(libhalo) and os.path.isfile(libhalo_stats)):
+        print '[*] Building libhalo.so...'
+        execute(['make', '-C', libhalo_path, 'libhalo',
+                 'IDENTIFY_HEADER=' + libhalo_header,
+                 'CHUNK_SIZE=' + str(args.chunk_size),
+                 'MAX_SPARE_CHUNKS=' + str(args.max_spare_chunks),
+                 'OUTPUT=' + libhalo])
+        execute(['make', '-C', libhalo_path, 'stats',
+                 'IDENTIFY_HEADER=' + libhalo_header,
+                 'CHUNK_SIZE=' + str(args.chunk_size),
+                 'MAX_SPARE_CHUNKS=' + str(args.max_spare_chunks),
+                 'OUTPUT=' + libhalo_stats])
+    else:
+        print '[*] Found existing libhalo.so...'
+
+    # generate runscripts
+    print '[*] Generating runscripts...'
+    args.ref_cmd_args[0] = modified_binary
+    run_optimised = os.path.join(destination, 'run-optimised-default.sh')
+    if args.jemalloc:
+        modified_jemalloc_binary_name = os.path.basename(original_train_binary) + '-jemalloc.bolt'
+        modified_jemalloc_binary = os.path.join(destination, modified_jemalloc_binary_name)
+        execute(['cp', modified_binary, modified_jemalloc_binary])
+        execute(['patchelf', '--add-needed', 'libjemalloc.so.2', modified_jemalloc_binary])
+        args.ref_cmd_args[0] = modified_jemalloc_binary
+        run_optimised = os.path.join(destination, 'run-optimised-jemalloc.sh')
+    if args.allocator_events:
+        libhalo = libhalo_stats
+        run_optimised = os.path.join(destination, 'run-optimised-stats.sh')
+    with open(run_optimised, 'w') as runscript:
+        runscript.write('LD_PRELOAD=' + libhalo + ' ')
+        runscript.write(' '.join(args.ref_cmd_args) + '\n')
+    make_executable(run_optimised)
+
+    cmds = [([run_optimised], ref_cwd)]
+    return (cmds, destination, args)
+
+def sweep(args):
+    # Parameter preprocessing
+    if args.sweep != 'merge-tolerance':
+        args.sweep_min = int(args.sweep_min)
+        args.sweep_max = int(args.sweep_max)
+        args.sweep_step = int(args.sweep_step)
+
+    # Set destination directory
+    destination = 'sweep-{}'.format(args.sweep)
+    destination += '-from-{}'.format(args.sweep_min)
+    destination += '-to-{}'.format(args.sweep_max)
+    destination += '-step-{}'.format(args.sweep_step)
+    destination += '-{}'.format(args.sweep_type)
+    destination = os.path.join(args.directory, destination)
+    args.directory = destination
+    args.sweep = args.sweep.replace('-', '_')
+
+    # Generate inputs
+    inputs = []
+    setup_pool = Pool(processes=args.num_threads)
+    value = args.sweep_min
+    step = operator.add if args.sweep_type == 'additive' else operator.mul
+    while value <= args.sweep_max:
+        setattr(args, args.sweep, value)
+        inputs.append(copy.deepcopy(args))
+        value = step(value, args.sweep_step)
+    inputs = setup_pool.imap_unordered(setup, inputs)
+    setup_pool.close()
+    setup_pool.join()
+    if args.setup_only:
+        return
+
+    # Sweep
+    execute_pool = Pool(processes=args.num_threads, initargs=(execute_resource,))
+    results = list(execute_pool.imap_unordered(run_trials_carefully, inputs))
+    execute_pool.close()
+    execute_pool.join()
+
+    # Write output
+    results = dict((getattr(args, args.sweep),
+                    os.path.relpath(f, destination)) for (args, f) in results)
+    results = { 'type': 'sweep', 'sweep_parameter': args.sweep,
+                'sweep_type': args.sweep_type, 'sweep_step': args.sweep_step,
+                'data': results }
+    resultfile = os.path.join(destination, 'results.json')
+    with open(resultfile, 'w') as outfile:
+        json.dump(results, outfile)
+        outfile.write('\n')
+
+def calculate_metric(metric, stats):
+    if metric == 'peak_fragmentation':
+        return [float(i) - float(j) for i, j in zip(stats['peak resident'], stats['peak resident live_bytes'])]
+    elif metric == 'peak_fragmentation_ratio':
+        return [(float(i) - float(j)) / float(i) for i, j in zip(stats['peak resident'], stats['peak resident live_bytes'])]
+    return stats[metric]
+
+def extract_metric(metric, stats, baseline=None):
+    result = None
+    if metric.endswith("@relative"):
+        metric = metric[:-9]
+        return [(float(value) / float(baseline)) for baseline, value in zip(calculate_metric(metric, baseline), calculate_metric(metric, stats))]
+    elif metric.endswith("@speedup"):
+        metric = metric[:-8]
+        return [(float(baseline) / float(value)) if value else 0 for baseline, value in zip(calculate_metric(metric, baseline), calculate_metric(metric, stats))]
+    elif metric.endswith("@improvement"):
+        metric = metric[:-12]
+        return [((float(value) - float(baseline)) / float(baseline)) if value else 0 for baseline, value in zip(calculate_metric(metric, baseline), calculate_metric(metric, stats))]
+    elif metric.endswith("@negimprovement"):
+        metric = metric[:-15]
+        return [(-(float(value) - float(baseline)) / float(baseline)) if value else 0 for baseline, value in zip(calculate_metric(metric, baseline), calculate_metric(metric, stats))]
+    return calculate_metric(metric, stats)
+
+def plot(args):
+    # Parse JSON
+    root_type = None
+    data = []
+    for path in args.path:
+        if path == 'zero':
+            data.append({ 'data': { 'script': defaultdict(lambda: list([0])) } })
+        else:
+            with open(path, 'r') as f:
+                raw_data = json.load(f)
+                root_type = raw_data.pop('type')
+                data.append(raw_data)
+    if root_type == 'sweep' and len(data) != 1:
+        raise ValueError('cannot plot sweep alongside other source directories')
+    elif root_type == 'sweep' and (args.group != 1 or args.group_label):
+        raise ValueError('cannot group sweep results')
+    elif root_type != 'sweep' and args.baseline:
+        raise ValueError('invalid flag --baseline for non-sweep data')
+
+    # Set styles
+    plt.rcParams['axes.spines.bottom'] = True
+    if root_type == 'sweep':
+        plt.rcParams['xtick.bottom'] = True
+
+    # Create figure
+    plt.figure(figsize=(args.x_size, args.y_size))
+    plt.ylabel(args.y_label if args.y_label else args.metric)
+    ax = plt.gca()
+    for _ in range(args.colour_skip):
+        ax._get_lines.get_next_color()
+    if root_type == 'sweep':
+        results = {}
+        data = data[0]
+        path = args.path[0]
+        plt.xlabel(args.x_label if args.x_label else data['sweep_parameter'])
+        if data['sweep_type'] == 'multiplicative':
+            plt.xscale('log', basex=data['sweep_step'])
+        for value, filename in data['data'].items():
+            value = make_numeric(value)
+            filename = os.path.join(os.path.dirname(path), filename)
+            with open(filename, 'r') as f:
+                data = json.load(f)
+                for script, stats in data['data'].items():
+                    results.setdefault(script, {})
+                    results[script][value] = stats[args.metric]
+        for script in results:
+            df = pd.DataFrame.from_dict(results[script]).T.sort_index()
+            error_bars = df.quantile([.25, .75], axis=1)
+            error_bars.loc[[0.25]] = df.median(1) - error_bars.loc[[0.25]]
+            error_bars.loc[[0.75]] = error_bars.loc[[0.75]] - df.median(1)
+            error_bars_values = [error_bars.values]
+            label = args.label[0] if args.label else script
+            median = df.median(1)
+            median.plot(yerr=error_bars_values, label=label)
+            print median
+        if args.baseline:
+            with open(args.baseline, 'r') as f:
+                data = json.load(f)
+            if data['type'] != 'run':
+                raise ValueError('invalid baseline result type')
+            baseline = list(data['data'].values())[0]
+            baseline = { args.metric: baseline[args.metric] }
+            df = pd.DataFrame.from_dict(baseline).T.sort_index()
+            median = df.median(1)
+            print median[0]
+            plt.axhline(y=median[0], color='grey', linestyle='dashed')
+        if args.label:
+            plt.legend(loc='upper right')
+        ax.set_yticks(list(plt.yticks()[0]))
+
+    else:
+        ax.spines['bottom'].set_position('zero')
+        bar_data = [[] for group in range(args.group)]
+        bar_errs = [[[], []] for group in range(args.group)]
+        baseline = None
+        group = 0
+        #color_cycle = plt.rcParams['axes.prop_cycle']
+        #color_cycle = cycler('color', ['#103C54', '#2095B8', '#A2B770', '#EAC750', '#EF6C2E'])
+        #ax.set_prop_cycle(color_cycle)
+        for v in data:
+            for script, stats in v['data'].items():
+                if group == 0:
+                    baseline = stats
+                stats = extract_metric(args.metric, stats, baseline)
+                df = pd.DataFrame.from_dict(stats).sort_index()
+                error_bars = df.quantile([.25, .75])
+                error_bars.loc[[0.25]] = df.median() - error_bars.loc[[0.25]]
+                error_bars.loc[[0.75]] = error_bars.loc[[0.75]] - df.median()
+                error_bars_values = [error_bars.values]
+                median = df.median()[0]
+                bar_data[group].append(median)
+                bar_errs[group][0].append(error_bars_values[0][0][0])
+                bar_errs[group][1].append(error_bars_values[0][1][0])
+                group = (group + 1) % args.group
+
+        if '@' in args.metric:
+            args.group -= 1
+            if args.group_label:
+                args.group_label.pop(0)
+            bar_data.pop(0)
+            bar_errs.pop(0)
+
+        bar_width = 0.6 / args.group
+        #if args.label:
+        #    total_maximum = max([max(bar_data[x]) for x in range(args.group)])
+        #    total_minimum = min([min(bar_data[x]) for x in range(args.group)])
+        #    for i in range(len(bar_data[0])):
+        #        cutoff = 0.005
+        #        spline_pad = 0.0325
+        #        maximum = max([bar_data[x][i] for x in range(args.group)])
+        #        minimum = min([bar_data[x][i] for x in range(args.group)])
+        #        minimum = min(minimum, 0)
+        #        x = i + ((bar_width / 2) * (args.group - 1))
+        #        if maximum <= cutoff and minimum <= -cutoff:
+        #            pad = (total_maximum - total_minimum) * 0.0425
+        #            ax.annotate(args.label[i], (x, pad), ha='center', va='bottom', size=mpl.rcParams['xtick.labelsize'])
+        #        else:
+        #            pad = (total_maximum - total_minimum) * (0.0425 + spline_pad)
+        #            if args.label[i] == 'omnetpp':
+        #                pad = pad * 1.18
+        #            ax.annotate(args.label[i], (x, 0 - pad), ha='center', va='bottom', size=mpl.rcParams['xtick.labelsize'])
+
+        for group in range(args.group):
+            index = np.arange(len(bar_data[group]))
+            colour = '#000000f0'
+            bar_opts = { 'yerr': bar_errs[group],
+                          'error_kw': dict(lw=1, capsize=2, capthick=1,
+                                           ecolor=colour) }
+            if args.group_label:
+                bar_opts['label'] = args.group_label[group]
+            ax.bar(index + bar_width * group, bar_data[group], bar_width,
+                   **bar_opts)
+        ax.set_xticks(index + ((bar_width / 2) * group))
+        if args.label:
+            ax.set_xticklabels(args.label)
+        if args.metric.endswith('improvement'):
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: '{:.0%}'.format(y)))
+        if args.group_label:
+            plt.legend(loc='upper center', ncol=args.group)
+
+    ax.xaxis.grid(False)
+    plt.tight_layout()
+    if args.save_as:
+        plt.savefig(args.save_as)
+    plt.show()
+
+
+def main():
+    args = sys.argv[1:]
+    subcommand = args.pop(0)
+
+    # Process subcommands
+    if subcommand == 'baseline':
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--pmu-events', type=str)
+        parser.add_argument('--allocator-events', type=str)
+        parser.add_argument('--jemalloc', action='store_true')
+        parser.add_argument('--trials', type=int, default=0)
+        parser.add_argument('--directory', type=str, default=os.getcwd())
+        parser.add_argument('--num-threads', type=int, default=min(16,
+                                                                   cpu_count()))
+        parser.add_argument('--max-run-tasks', type=int, default=1)
+        parser.add_argument('cmd_args', nargs=argparse.REMAINDER)
+        args = parser.parse_args(args)
+        args.directory = os.path.abspath(args.directory)
+        args.setup_only = False
+        if args.cmd_args[0] != '--':
+            raise ValueError('could not find baseline command')
+        args.cmd_args.pop(0)
+        args.cmd_args = [parts for x in args.cmd_args for parts in x.split(' ')]
+        if '--' in args.cmd_args:
+            raise ValueError('found redundant command separator')
+        init(args)
+        baseline(args)
+    elif subcommand == 'run':
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--affinity-distance', type=int, default=4096)
+        parser.add_argument('--max-object-size', type=int, default=4096)
+        parser.add_argument('--training-inst-limit', type=int, default=0)
+        parser.add_argument('--max-stack-depth', type=int, default=0)
+        parser.add_argument('--min-edge-weight', type=int, default=25)
+        parser.add_argument('--merge-tolerance', type=float, default=0.05)
+        parser.add_argument('--max-groups', type=int, default=15)
+        parser.add_argument('--min-group-access-percentage', type=float, default=0.025)
+        parser.add_argument('--max-selector-length', type=int, default=0)
+        parser.add_argument('--selector-exclude', action='append', default=[])
+        parser.add_argument('--chunk-size', type=int, default=1048576)
+        parser.add_argument('--max-spare-chunks', type=int, default=1)
+        parser.add_argument('--pmu-events', type=str)
+        parser.add_argument('--allocator-events', type=str)
+        parser.add_argument('--jemalloc', action='store_true')
+        parser.add_argument('--trials', type=int, default=0)
+        parser.add_argument('--graph', type=str)
+        parser.add_argument('--contexts', type=str)
+        parser.add_argument('--run-script', type=str)
+        parser.add_argument('--setup-only', action='store_true')
+        parser.add_argument('--sweep', choices=['affinity-distance',
+                                                'max-object-size',
+                                                'merge-tolerance',
+                                                'max-selector-length',
+                                                'chunk-size',
+                                                'max-spare-chunks'])
+        parser.add_argument('--sweep-min', type=float)
+        parser.add_argument('--sweep-max', type=float)
+        parser.add_argument('--sweep-type', choices=['additive', 'multiplicative'])
+        parser.add_argument('--sweep-step', type=float)
+        parser.add_argument('--directory', type=str, default=os.getcwd())
+        parser.add_argument('--num-threads', type=int, default=min(16,
+                                                                   cpu_count()))
+        parser.add_argument('--max-run-tasks', type=int, default=1)
+        parser.add_argument('cmd_args', nargs=argparse.REMAINDER)
+        args = parser.parse_args(args)
+        args.directory = os.path.abspath(args.directory)
+        if args.cmd_args[0] != '--':
+            raise ValueError('could not find training and reference commands')
+        args.cmd_args.pop(0)
+        if '--' not in args.cmd_args:
+            raise ValueError('must specify both training and reference commands')
+        separator = args.cmd_args.index('--')
+        args.train_cmd_args = args.cmd_args[:separator]
+        args.train_cmd_args = [parts for x in args.train_cmd_args
+                                     for parts in x.split(' ')]
+        args.ref_cmd_args = args.cmd_args[(separator + 1):]
+        args.ref_cmd_args = [parts for x in args.ref_cmd_args
+                                   for parts in x.split(' ')]
+        init(args)
+        if args.sweep is None:
+            run_trials(setup(args))
+        else:
+            if not (args.sweep_min and args.sweep_max and args.sweep_step):
+                raise ValueError('must specify min, max, and step for sweep')
+            sweep(args)
+    elif subcommand == 'plot':
+        parser = argparse.ArgumentParser()
+        parser.add_argument('path', nargs=argparse.REMAINDER)
+        parser.add_argument('--metric', type=str, default='time elapsed')
+        parser.add_argument('--baseline', type=str)
+        parser.add_argument('--label', action='append')
+        parser.add_argument('--group', type=int, default=1)
+        parser.add_argument('--group-label', action='append', default=[])
+        parser.add_argument('--x-size', type=int, default=9)
+        parser.add_argument('--y-size', type=int, default=4)
+        parser.add_argument('--x-label', type=str)
+        parser.add_argument('--y-label', type=str)
+        parser.add_argument('--colour-skip', type=int, default=0)
+        parser.add_argument('--save-as', type=str)
+        args = parser.parse_args(args)
+        plot(args)
+    else:
+        raise ValueError('invalid subcommand: {}'.format(subcommand))
+
+
+if __name__ == "__main__":
+    main()
