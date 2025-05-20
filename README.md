@@ -87,24 +87,31 @@ pip install numpy pandas "networkx>=2.0" matplotlib
 export LIBHALO_PATH="$(pwd)/libhalo"
 
 # Clone LLVM and BOLT, applying custom patches
-git clone https://github.com/llvm-mirror/llvm llvm
-cd llvm/tools
-git clone https://github.com/facebookincubator/BOLT llvm-bolt
+mkdir llvm
+cd llvm
+git init
+git remote add origin https://github.com/llvm-mirror/llvm llvm
+git fetch origin --depth 1 f137ed238db11440f03083b1c88b7ffc0f4af65e
+git checkout -b llvm-bolt f137ed238db11440f03083b1c88b7ffc0f4af65e
+cd tools
+mkdir llvm-bolt
 cd llvm-bolt
+git init
+git remote add origin https://github.com/facebookincubator/BOLT
+git fetch origin --depth 1 e37d18ee516816dc537afe2a0dfbbaf5ae3825fc
 git checkout e37d18ee516816dc537afe2a0dfbbaf5ae3825fc
 git apply ../../../bolt.patch
 cd ..
 
 # Set up and build BOLT, as per the BOLT README, adding the results to your PATH
 sudo apt-get install cmake ninja-build
-git checkout -b llvm-bolt f137ed238db11440f03083b1c88b7ffc0f4af65e
 cd ..
 patch -p 1 < tools/llvm-bolt/llvm.patch
 cd ..
 mkdir llvm_build
 cd llvm_build
 cmake -G Ninja ../llvm -DLLVM_TARGETS_TO_BUILD="X86;AArch64" -DCMAKE_BUILD_TYPE=Release
-ninja
+ninja # here need to fix an error
 export PATH="$PATH:$(pwd)/bin"
 cd ..
 
