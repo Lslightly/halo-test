@@ -1,0 +1,12 @@
+[project]
+name = "cgo2020-halo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.9.4",
+    "networkx>=3.2.1",
+    "numpy>=2.0.2",
+    "pandas>=2.2.3",
+]

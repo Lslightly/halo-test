@@ -127,6 +127,8 @@ export PATH="$PATH:$(pwd)/$(echo pin-*)"
 
 # Build the halo-prof Pin tool, setting related environment variables
 mv halo-prof pin-*/source/tools
+mkdir halo-prof
+mount-halo-prof.sh
 cd pin-*/source/tools/halo-prof
 make
 export HALO_PROF_PATH="$(pwd)"
