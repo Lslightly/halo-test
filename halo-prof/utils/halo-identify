@@ -6,7 +6,6 @@ import argparse
 import numpy as np
 from math import sqrt
 from collections import Counter
-from sets import Set
 
 MAX_SITES = 64
 
@@ -57,7 +56,7 @@ def abstractions(location):
 def count_matches(selector, contexts):
     results = {}
     for context in contexts.values():
-        if selector.issubset(Set(context.chain)):
+        if selector.issubset(set(context.chain)):
             for location in context.chain:
                 if location not in results:
                     results[location] = Counter()
@@ -78,7 +77,7 @@ def analyse(groups, contexts, max_size, max_selector_length, exclude, outdir):
         for context in group.contexts:
             # Find a chain of call sites that uniquely identifies this context
             # or other objects within this group
-            selector = Set()
+            selector = set()
             conflicts = np.inf
             while conflicts and len(selector) < max_selector_length:
                 # NOTE: In the case of a draw, we prefer the minimum lower in
@@ -112,7 +111,7 @@ def analyse(groups, contexts, max_size, max_selector_length, exclude, outdir):
             # in most cases, increased specificity means more frequent execution
             for location in reversed(selector_locs):
                 for abstracted in abstractions(location):
-                    new_selector = selector - Set([location])
+                    new_selector = selector - set([location])
                     new_selector.add(abstracted)
                     matches = count_matches(new_selector, contexts)
                     matches = sum(v for cntr in matches.values()
@@ -138,12 +137,12 @@ def analyse(groups, contexts, max_size, max_selector_length, exclude, outdir):
                     next_site_id += 1
 
     # Print BOLT HALO command line
-    print 'BOLT command line:',
-    print 'llvm-bolt $INPUT -o $OUTPUT -halo',
+    print('BOLT command line:')
+    print('llvm-bolt $INPUT -o $OUTPUT -halo ', end='')
     site_id_list = sorted(loc_ids.items(), key=lambda x: x[1])
     site_id_list = ['{}:0x{:X}'.format(loc_id, loc[0])
                     for loc, loc_id in site_id_list]
-    print ','.join(site_id_list) if site_id_list else '""'
+    print(','.join(site_id_list) if site_id_list else '""')
 
     # Generate 'identify.h'
     with open(os.path.join(outdir, 'identify.h'), 'w') as outfile:
@@ -211,7 +210,7 @@ def main():
     parser.add_argument('--groups', required=True)
     parser.add_argument('--contexts', required=True)
     parser.add_argument('--max-object-size', type=int, default=4096)
-    parser.add_argument('--max-selector-length', type=int, default=sys.maxint)
+    parser.add_argument('--max-selector-length', type=int, default=sys.maxsize)
     parser.add_argument('--outdir', default=os.getcwd())
     parser.add_argument('--exclude', action='append', default=[])
     args = parser.parse_args()
@@ -276,7 +275,7 @@ def main():
 
     # Analyse
     if args.max_selector_length == 0:
-        args.max_selector_length = sys.maxint
+        args.max_selector_length = sys.maxsize
     analyse(groups, contexts, args.max_object_size, args.max_selector_length,
             args.exclude, args.outdir)
 

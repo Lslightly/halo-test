@@ -56,7 +56,7 @@ fruitful ground for future research.
 
 At current, the only supported software environment is x86-64 Linux (in part,
 due to limitations of BOLT at the time of development). Dependencies include
-`cmake`, `ninja`, `perf`, `patchelf`, and Python 2.7, which we expect are
+`cmake`, `ninja`, `perf`, `patchelf`, and Python 3, which we expect are
 installed on the system prior to following the setup instructions below.
 
 To replicate the results presented in the original paper, we recommend testing

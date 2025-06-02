@@ -34,7 +34,7 @@ def node_heat(graph, available):
 # Rank available nodes via node_heat
 def rank_available_nodes(graph, available):
     available = node_heat(graph, available).items()
-    available = sorted(available, key=lambda (i, x): -x)
+    available = sorted(available, key=lambda x: -x[1])
     return [i for i, x in available]
 
 # Only merge if it's beneficial for both parties
@@ -133,7 +133,7 @@ def main():
         groups.append((group, sum(node_degrees.values())))
 
     # Print groups
-    groups = sorted(groups, key=lambda (g, w): -w)
+    groups = sorted(groups, key=lambda w: -w[1])
     total_accesses = sum(x for i, x in graph.nodes.data('accesses'))
     with open(os.path.join(args.outdir, 'groups.txt'), 'w') as outfile:
         for group, weight in groups:

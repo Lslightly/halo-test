@@ -46,11 +46,16 @@ def newer(a, b):
 def execute(cmds, cwd=None, shell=False):
     if isinstance(cmds, list):
         cmds = [str(cmd) for cmd in cmds]
-        print ' '.join(cmds)
+        print(' '.join(cmds))
     else:
-        print cmds
-    return subprocess.check_output(cmds, cwd=cwd, shell=shell,
+        print(cmds)
+    try:
+        res = subprocess.check_output(cmds, cwd=cwd, shell=shell, text=True,
                                    stderr=subprocess.STDOUT)
+        return res
+    except subprocess.CalledProcessError as e:
+        print(e.output)
+        raise e
 
 def init(args):
     global execute_resource
@@ -60,10 +65,10 @@ def run_trials_carefully(x):
     try:
         return run_trials(x)
     except:
-        print traceback.format_exc()
+        print(traceback.format_exc())
         sys.exit(1)
 
-def run_trials((scripts, destination, args)):
+def run_trials(scripts, destination, args):
     if args.setup_only:
         return
     events = ['time elapsed']
@@ -94,12 +99,10 @@ def run_trials((scripts, destination, args)):
                     results[label][specifier].append(value)
                 results[label] = {}
                 for trial in range(args.trials + 1):
-                    print '[*] Running trial {}/{} for {}...'.format(trial,
-                                                                     args.trials,
-                                                                     label)
+                    print('[*] Running trial {}/{} for {}...'.format(trial, args.trials, label))
                     lines = execute(perf_stat + cmd,
                                     cwd=cwd).split('\n')
-                    lines = filter(None, lines)
+                    lines = list(filter(None, lines))
                     if trial > 0 or not args.trials:
                         for event in events:
                             extract(lines, event)
@@ -107,9 +110,9 @@ def run_trials((scripts, destination, args)):
             with open(resultfile, 'w') as outfile:
                 json.dump(results, outfile)
                 outfile.write('\n')
-            print '[*] Complete!'
+            print('[*] Complete!')
         else:
-            print '[*] Found existing results file!'
+            print('[*] Found existing results file!')
     return (args, resultfile)
 
 def baseline(args):
@@ -130,7 +133,7 @@ def baseline(args):
         runscript.write(' '.join(args.cmd_args) + '\n')
     make_executable(script)
     cmds = [([script], cwd)]
-    return run_trials((cmds, destination, args))
+    return run_trials(cmds, destination, args)
 
 def setup(args):
     # Ensure destination directory exists
@@ -176,7 +179,7 @@ def setup(args):
 
     # halo-prof
     if not (os.path.isfile(contexts) and os.path.isfile(graph)):
-        print '[*] Profiling workload...'
+        print('[*] Profiling workload...')
         halo_prof_path = os.environ['HALO_PROF_PATH']
         tool_path = os.path.join(halo_prof_path, 'obj-intel64',
                                  'halo-prof.so')
@@ -188,12 +191,12 @@ def setup(args):
                  '-affinity_distance', str(args.affinity_distance),
                  '--'] + args.train_cmd_args), cwd=train_cwd, shell=True)
     else:
-        print '[*] Found existing locality graph and contexts file...'
+        print('[*] Found existing locality graph and contexts file...')
 
     # halo-group
     groups = os.path.join(destination, 'groups.txt')
     if not os.path.isfile(groups):
-        print '[*] Grouping allocation contexts...'
+        print('[*] Grouping allocation contexts...')
         execute(['halo-group', '--outdir', destination, '--graph', graph,
                  '--contexts', contexts,
                  '--min-edge-weight', args.min_edge_weight,
@@ -202,7 +205,7 @@ def setup(args):
                  '--min-group-access-percentage',
                  args.min_group_access_percentage])
     else:
-        print '[*] Found existing groups file...'
+        print('[*] Found existing groups file...')
 
     # halo-identify and llvm-bolt
     #if (newer(original_train_binary, graph) or
@@ -211,7 +214,7 @@ def setup(args):
     modified_binary_name = os.path.basename(original_train_binary) + '.bolt'
     modified_binary = os.path.join(destination, modified_binary_name)
     if not os.path.isfile(modified_binary):
-        print '[*] Optimising binary...'
+        print('[*] Optimising binary...')
         cmd = ['halo-identify', '--outdir', destination,
                '--groups', groups, '--contexts', contexts,
                '--max-object-size', args.max_object_size,
@@ -225,7 +228,7 @@ def setup(args):
         separator = cmd.index('llvm-bolt')
         execute(cmd[separator:], shell=True)
     else:
-        print '[*] Found existing optimised binary...'
+        print('[*] Found existing optimised binary...')
 
     # libhalo
     libhalo_path = os.environ['LIBHALO_PATH']
@@ -233,7 +236,7 @@ def setup(args):
     libhalo = os.path.join(destination, 'libhalo.so')
     libhalo_stats = os.path.join(destination, 'libhalo-stats.so')
     if not (os.path.isfile(libhalo) and os.path.isfile(libhalo_stats)):
-        print '[*] Building libhalo.so...'
+        print('[*] Building libhalo.so...')
         execute(['make', '-C', libhalo_path, 'libhalo',
                  'IDENTIFY_HEADER=' + libhalo_header,
                  'CHUNK_SIZE=' + str(args.chunk_size),
@@ -245,10 +248,10 @@ def setup(args):
                  'MAX_SPARE_CHUNKS=' + str(args.max_spare_chunks),
                  'OUTPUT=' + libhalo_stats])
     else:
-        print '[*] Found existing libhalo.so...'
+        print('[*] Found existing libhalo.so...')
 
     # generate runscripts
-    print '[*] Generating runscripts...'
+    print('[*] Generating runscripts...')
     args.ref_cmd_args[0] = modified_binary
     run_optimised = os.path.join(destination, 'run-optimised-default.sh')
     if args.jemalloc:
@@ -395,7 +398,7 @@ def plot(args):
             label = args.label[0] if args.label else script
             median = df.median(1)
             median.plot(yerr=error_bars_values, label=label)
-            print median
+            print(median)
         if args.baseline:
             with open(args.baseline, 'r') as f:
                 data = json.load(f)
@@ -405,7 +408,7 @@ def plot(args):
             baseline = { args.metric: baseline[args.metric] }
             df = pd.DataFrame.from_dict(baseline).T.sort_index()
             median = df.median(1)
-            print median[0]
+            print(median[0])
             plt.axhline(y=median[0], color='grey', linestyle='dashed')
         if args.label:
             plt.legend(loc='upper right')
@@ -568,7 +571,8 @@ def main():
                                    for parts in x.split(' ')]
         init(args)
         if args.sweep is None:
-            run_trials(setup(args))
+            cmds, destination, args = setup(args)
+            run_trials(cmds, destination, args)
         else:
             if not (args.sweep_min and args.sweep_max and args.sweep_step):
                 raise ValueError('must specify min, max, and step for sweep')
