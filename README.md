@@ -1,6 +1,6 @@
 # Heap Allocation Layout Optimiser (HALO)
 
-> This repository is obtained from https://www.repository.cam.ac.uk/items/09bb8ba0-37f0-49a7-bd7d-383ef446d17a. I add some additional adaption to LLVM 20.1.4. See [Lslightly/llvm-project](https://github.com/Lslightly/llvm-project/tree/halo-bolt-llvmorg-20.1.4). The setup script has been modified accordingly.
+> This repository is obtained from https://www.repository.cam.ac.uk/items/09bb8ba0-37f0-49a7-bd7d-383ef446d17a. I add some additional adaption to LLVM 20.1.4. See [Lslightly/llvm-project](https://github.com/Lslightly/llvm-project/tree/halo-bolt-llvmorg-20.1.4). The setup script has been modified accordingly. Besides, I migrated the python script from python2 to python3.
 
 This repository contains the code required to validate the primary results of:
 
